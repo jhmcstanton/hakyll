@@ -5,11 +5,13 @@ module Hakyll.Core.Runtime
 
 
 --------------------------------------------------------------------------------
+import           Control.Concurrent.Async      (Async, async, wait)
+import           Control.Concurrent.STM
 import           Control.Monad                 (unless)
 import           Control.Monad.Except          (ExceptT, runExceptT, throwError)
 import           Control.Monad.Reader          (ask)
 import           Control.Monad.RWS             (RWST, runRWST)
-import           Control.Monad.State           (get, modify)
+import qualified Control.Monad.State as State  (get, modify)
 import           Control.Monad.Trans           (liftIO)
 import           Data.List                     (intercalate)
 import           Data.Map                      (Map)
@@ -67,10 +69,11 @@ run config logger rules = do
             , runtimeRoutes        = rulesRoutes ruleSet
             , runtimeUniverse      = M.fromList compilers
             }
-        state     = RuntimeState
+    state <- newTVarIO $ RuntimeState'
             { runtimeDone      = S.empty
             , runtimeSnapshots = S.empty
             , runtimeTodo      = M.empty
+            , runtimeWorkers   = M.empty
             , runtimeFacts     = oldFacts
             }
 
@@ -82,7 +85,8 @@ run config logger rules = do
             Logger.flush logger
             return (ExitFailure 1, ruleSet)
 
-        Right (_, s, _) -> do
+        Right (_, sVar, _) -> do
+            s <- readTVarIO sVar
             Store.set store factsKey $ runtimeFacts s
 
             Logger.debug logger "Removing tmp directory..."
@@ -106,14 +110,15 @@ data RuntimeRead = RuntimeRead
 
 
 --------------------------------------------------------------------------------
-data RuntimeState = RuntimeState
+data RuntimeState' = RuntimeState'
     { runtimeDone      :: Set Identifier
     , runtimeSnapshots :: Set (Identifier, Snapshot)
     , runtimeTodo      :: Map Identifier (Compiler SomeItem)
+    , runtimeWorkers   :: Map Identifier (Async (Runtime()))
     , runtimeFacts     :: DependencyFacts
     }
 
-
+type RuntimeState = TVar RuntimeState'
 --------------------------------------------------------------------------------
 type Runtime a = RWST RuntimeRead () RuntimeState (ExceptT String IO) a
 
@@ -161,13 +166,24 @@ scheduleOutOfDate = do
 --------------------------------------------------------------------------------
 pickAndChase :: Runtime ()
 pickAndChase = do
-    todo <- runtimeTodo <$> get
-    case M.minViewWithKey todo of
-        Nothing            -> return ()
+    todo         <- runtimeTodo    <$> get
+    workers      <- runtimeWorkers <$> get
+    let todo'     = M.filterWithKey (\k _ -> not $ k `M.member` workers) todo
+    case M.minViewWithKey todo' of
+        Nothing            -> do
+            completedIds <- runtimeDone <$> get
+            liftIO . putStrLn $ "1 Completed ids: " ++ (show completedIds)
+            liftIO . putStrLn $ "1 Worker ids: " ++ (show $ M.keys workers)
+            rs <- liftIO $ traverse wait workers
+            _  <- sequence rs -- wait on the workers
+            completedIds <- runtimeDone <$> get
+            workers      <- runtimeWorkers <$> get
+            liftIO . putStrLn $ "2 Completed ids: " ++ (show completedIds)
+            liftIO . putStrLn $ "2 Worker ids: " ++ (show $ M.keys workers)
+            pure ()
         Just ((id', _), _) -> do
             chase [] id'
             pickAndChase
-
 
 --------------------------------------------------------------------------------
 chase :: [Identifier] -> Identifier -> Runtime ()
@@ -176,6 +192,7 @@ chase trail id'
         "Dependency cycle detected: " ++ intercalate " depends on "
             (map show $ dropWhile (/= id') (reverse trail) ++ [id'])
     | otherwise        = do
+        liftIO . putStrLn $ "chasing " ++ (show id')
         logger   <- runtimeLogger        <$> ask
         todo     <- runtimeTodo          <$> get
         provider <- runtimeProvider      <$> ask
@@ -196,81 +213,131 @@ chase trail id'
                 , compilerLogger     = logger
                 }
 
-        result <- liftIO $ runCompiler compiler read'
-        case result of
-            -- Rethrow error
-            CompilerError [] -> throwError
-                "Compiler failed but no info given, try running with -v?"
-            CompilerError es -> throwError $ intercalate "; " es
+        result <- liftIO . async $ runCompiler compiler read'
+        let chased = fmap (handleResult trail id') result
+        modify $ \s ->
+          s { runtimeWorkers = M.insert id' chased (runtimeWorkers s) }
+        pure ()
 
-            -- Signal that a snapshot was saved ->
-            CompilerSnapshot snapshot c -> do
-                -- Update info. The next 'chase' will pick us again at some
-                -- point so we can continue then.
-                modify $ \s -> s
-                    { runtimeSnapshots =
-                        S.insert (id', snapshot) (runtimeSnapshots s)
-                    , runtimeTodo      = M.insert id' c (runtimeTodo s)
-                    }
+--------------------------------------------------------------------------------
+handleResult :: [Identifier] -> Identifier -> (CompilerResult SomeItem) -> Runtime ()
+handleResult trail id' result = do
+  liftIO . putStrLn $ "Top of Handle Result"
+  logger   <- runtimeLogger        <$> ask
+  provider <- runtimeProvider      <$> ask
+  routes   <- runtimeRoutes        <$> ask
+  store    <- runtimeStore         <$> ask
+  config   <- runtimeConfiguration <$> ask
+  case result of
+      -- Rethrow error
+      CompilerError [] -> throwError
+          "Compiler failed but no info given, try running with -v?"
+      CompilerError es -> throwError $ intercalate "; " es
 
-            -- Huge success
-            CompilerDone (SomeItem item) cwrite -> do
-                -- Print some info
-                let facts = compilerDependencies cwrite
-                    cacheHits
-                        | compilerCacheHits cwrite <= 0 = "updated"
-                        | otherwise                     = "cached "
-                Logger.message logger $ cacheHits ++ " " ++ show id'
+      -- Signal that a snapshot was saved ->
+      CompilerSnapshot snapshot c -> do
+          -- Update info. The next 'chase' will pick us again at some
+          -- point so we can continue then.
+          modify $ \s -> s
+              { runtimeSnapshots =
+                  S.insert (id', snapshot) (runtimeSnapshots s)
+              , runtimeTodo      = M.insert id' c (runtimeTodo s)
+              }
 
-                -- Sanity check
-                unless (itemIdentifier item == id') $ throwError $
-                    "The compiler yielded an Item with Identifier " ++
-                    show (itemIdentifier item) ++ ", but we were expecting " ++
-                    "an Item with Identifier " ++ show id' ++ " " ++
-                    "(you probably want to call makeItem to solve this problem)"
+      -- Huge success
+      CompilerDone (SomeItem item) cwrite -> do
+          -- Print some info
+          let facts = compilerDependencies cwrite
+              cacheHits
+                  | compilerCacheHits cwrite <= 0 = "updated"
+                  | otherwise                     = "cached "
+          Logger.message logger $ cacheHits ++ " " ++ show id'
 
-                -- Write if necessary
-                (mroute, _) <- liftIO $ runRoutes routes provider id'
-                case mroute of
-                    Nothing    -> return ()
-                    Just route -> do
-                        let path = destinationDirectory config </> route
-                        liftIO $ makeDirectories path
-                        liftIO $ write path item
-                        Logger.debug logger $ "Routed to " ++ path
+          -- Sanity check
+          unless (itemIdentifier item == id') $ throwError $
+              "The compiler yielded an Item with Identifier " ++
+              show (itemIdentifier item) ++ ", but we were expecting " ++
+              "an Item with Identifier " ++ show id' ++ " " ++
+              "(you probably want to call makeItem to solve this problem)"
 
-                -- Save! (For load)
-                liftIO $ save store item
+          -- Write if necessary
+          (mroute, _) <- liftIO $ runRoutes routes provider id'
+          case mroute of
+              Nothing    -> return ()
+              Just route -> do
+                  let path = destinationDirectory config </> route
+                  liftIO $ makeDirectories path
+                  liftIO $ write path item
+                  Logger.debug logger $ "Routed to " ++ path
 
-                -- Update state
-                modify $ \s -> s
-                    { runtimeDone  = S.insert id' (runtimeDone s)
-                    , runtimeTodo  = M.delete id' (runtimeTodo s)
-                    , runtimeFacts = M.insert id' facts (runtimeFacts s)
-                    }
+          -- Save! (For load)
+          liftIO $ save store item
 
-            -- Try something else first
-            CompilerRequire dep c -> do
-                -- Update the compiler so we don't execute it twice
-                let (depId, depSnapshot) = dep
-                done      <- runtimeDone <$> get
-                snapshots <- runtimeSnapshots <$> get
+          liftIO . putStrLn $ "In compiler done"
+          -- Update state
+          modify $ \s -> s
+              { runtimeDone  = S.insert id' (runtimeDone s)
+              , runtimeTodo  = M.delete id' (runtimeTodo s)
+              , runtimeFacts = M.insert id' facts (runtimeFacts s)
+              }
 
-                -- Done if we either completed the entire item (runtimeDone) or
-                -- if we previously saved the snapshot (runtimeSnapshots).
-                let depDone =
-                        depId `S.member` done ||
-                        (depId, depSnapshot) `S.member` snapshots
+      -- Try something else first
+      CompilerRequire dep c -> do
+          liftIO . putStrLn $ "In compilerRequire"
+          -- Update the compiler so we don't execute it twice
+          let (depId, depSnapshot) = dep
+          var <- State.get
+          (action, depDone) <- liftIO . atomically $ do
+            done      <- runtimeDone      <$> readTVar var
+            snapshots <- runtimeSnapshots <$> readTVar var
 
-                modify $ \s -> s
-                    { runtimeTodo = M.insert id'
-                        (if depDone then c else compilerResult result)
-                        (runtimeTodo s)
-                    }
+            -- Done if we either completed the entire item (runtimeDone) or
+            -- if we previously saved the snapshot (runtimeSnapshots).
+            let depDone =
+                    depId `S.member` done ||
+                    (depId, depSnapshot) `S.member` snapshots
 
-                -- If the required item is already compiled, continue, or, start
-                -- chasing that
-                Logger.debug logger $ "Require " ++ show depId ++
-                    " (snapshot " ++ depSnapshot ++ "): " ++
-                    (if depDone then "OK" else "chasing")
-                if depDone then chase trail id' else chase (id' : trail) depId
+            modifyTVar' var $ \s -> s {
+                  runtimeTodo = M.insert id'
+                    (if depDone then c else compilerResult result)
+                    (runtimeTodo s)
+                }
+
+            let runtimeAction = if depDone
+                                then chase trail id'
+                                else chase (id' : trail) depId
+            pure (runtimeAction, depDone)
+
+          action
+          -- If the required item is already compiled, continue, or, start
+          -- chasing that
+          Logger.debug logger $ "Require " ++ show depId ++
+              " (snapshot " ++ depSnapshot ++ "): " ++
+              (if depDone then "OK" else "chasing")
+          eThread <- liftIO . atomically $ do
+            workers <- runtimeWorkers <$> readTVar var
+            pure $ M.lookup (if depDone then id' else depId) workers
+          case eThread of
+            Nothing -> throwError concurrencyException
+            Just t  -> liftIO (wait t) >> pure ()
+
+--------------------------------------------------------------------------------
+-- WARNING: It is very easy to accidentally use an out-of-date
+-- version of RuntimeState' when updating it. Be very careful
+-- that your modify function only uses the provided reference
+modify :: (RuntimeState' -> RuntimeState') -> Runtime ()
+modify f = do
+  var <- State.get
+  liftIO . atomically $ do
+    modifyTVar' var f
+
+--------------------------------------------------------------------------------
+get :: Runtime RuntimeState'
+get = State.get >>= \var -> liftIO (readTVarIO var)
+
+--------------------------------------------------------------------------------
+concurrencyException :: String
+concurrencyException =
+  "Concurrency Exception. This should never happen. Please report this " ++
+  "to the Hakyll issue tracker. In the mean time, try running Hakyll " ++
+  "in single threaded mode using '+RTS -N1'."
