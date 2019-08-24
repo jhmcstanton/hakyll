@@ -17,6 +17,7 @@ import           Text.Blaze.Html.Renderer.String (renderHtml)
 
 --------------------------------------------------------------------------------
 import           Hakyll.Core.Item
+import           Hakyll.Core.Util.File           (attemptFileOperation)
 
 
 --------------------------------------------------------------------------------
@@ -33,24 +34,24 @@ instance Writable () where
 
 --------------------------------------------------------------------------------
 instance Writable [Char] where
-    write p = writeFile p . itemBody
+    write p i = attemptFileOperation p (\path -> writeFile path $ itemBody i)
 
 
 --------------------------------------------------------------------------------
 instance Writable SB.ByteString where
-    write p = SB.writeFile p . itemBody
+    write p i = attemptFileOperation p (\path -> SB.writeFile path $ itemBody i)
 
 
 --------------------------------------------------------------------------------
 instance Writable LB.ByteString where
-    write p = LB.writeFile p . itemBody
+    write p i = attemptFileOperation p (\path -> LB.writeFile path $ itemBody i)
 
 
 --------------------------------------------------------------------------------
 instance Writable [Word8] where
-    write p = write p . fmap SB.pack
+    write p i = attemptFileOperation p (\path -> write path $ fmap SB.pack i)
 
 
 --------------------------------------------------------------------------------
 instance Writable Html where
-    write p = write p . fmap renderHtml
+    write p i = attemptFileOperation p (\path -> write path $ fmap renderHtml i)

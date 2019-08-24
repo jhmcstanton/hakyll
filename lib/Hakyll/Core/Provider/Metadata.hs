@@ -26,6 +26,7 @@ import qualified Data.Yaml                     as Yaml
 import           Hakyll.Core.Identifier
 import           Hakyll.Core.Metadata
 import           Hakyll.Core.Provider.Internal
+import           Hakyll.Core.Util.File        (attemptOpenFile, attemptReadFile)
 import           System.IO                     as IO
 
 
@@ -51,7 +52,7 @@ loadMetadata p identifier = do
 --------------------------------------------------------------------------------
 loadMetadataHeader :: FilePath -> IO (Metadata, String)
 loadMetadataHeader fp = do
-    fileContent <- readFile fp
+    fileContent <- attemptReadFile fp
     case parsePage fileContent of
         Right x   -> return x
         Left  err -> throwIO $ MetadataException fp err
@@ -70,7 +71,7 @@ loadMetadataFile fp = do
 -- to exclude binary files (which are unlikely to start with "---").
 probablyHasMetadataHeader :: FilePath -> IO Bool
 probablyHasMetadataHeader fp = do
-    handle <- IO.openFile fp IO.ReadMode
+    handle <- attemptOpenFile fp ReadMode
     bs     <- BC.hGet handle 1024
     IO.hClose handle
     return $ isMetadataHeader bs

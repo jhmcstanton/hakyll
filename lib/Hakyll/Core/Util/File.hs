@@ -4,15 +4,22 @@ module Hakyll.Core.Util.File
     ( makeDirectories
     , getRecursiveContents
     , removeDirectory
+    , attemptOpenFile
+    , attemptReadFile
+    , attemptFileOperation
     ) where
 
 
 --------------------------------------------------------------------------------
+import           Control.Concurrent  (threadDelay)
+import           Control.Exception   (try)
 import           Control.Monad       (filterM, forM, when)
 import           System.Directory    (createDirectoryIfMissing,
                                       doesDirectoryExist, getDirectoryContents,
                                       removeDirectoryRecursive)
 import           System.FilePath     (takeDirectory, (</>))
+import           System.IO           (Handle, IOMode, openFile, readFile)
+import           System.IO.Error     (ioError, isAlreadyInUseError)
 
 
 --------------------------------------------------------------------------------
@@ -54,3 +61,26 @@ removeDirectory :: FilePath -> IO ()
 removeDirectory fp = do
     e <- doesDirectoryExist fp
     when e $ removeDirectoryRecursive fp
+
+--------------------------------------------------------------------------------
+attemptOpenFile :: FilePath -> IOMode -> IO Handle
+attemptOpenFile path mode = attemptFileOperation path (\p -> openFile p mode)
+
+--------------------------------------------------------------------------------
+attemptReadFile :: FilePath -> IO String
+attemptReadFile path = attemptFileOperation path readFile
+
+--------------------------------------------------------------------------------
+attemptFileOperation :: FilePath -> (FilePath -> IO a) -> IO a
+attemptFileOperation path op = go (10 :: Int) where
+  go attemptNo = do
+    eitherA <- try $ op path
+    case eitherA of
+      Left err -> do
+        if isAlreadyInUseError err && attemptNo > 0
+        then do
+          putStrLn $ "Remove this message: in attemptFileOperation. Something failed, looping: " ++ show attemptNo
+          threadDelay 1000000
+          go (attemptNo - 1)
+        else ioError err
+      Right a -> pure a

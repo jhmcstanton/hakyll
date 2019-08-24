@@ -156,7 +156,7 @@ resourceFilePath p i = providerDirectory p </> toFilePath i
 --------------------------------------------------------------------------------
 -- | Get the raw body of a resource as string
 resourceString :: Provider -> Identifier -> IO String
-resourceString p i = readFile $ resourceFilePath p i
+resourceString p i = attemptReadFile $ resourceFilePath p i
 
 
 --------------------------------------------------------------------------------

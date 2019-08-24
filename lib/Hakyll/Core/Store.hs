@@ -31,8 +31,9 @@ import           Numeric              (showHex)
 import           System.Directory     (createDirectoryIfMissing)
 import           System.Directory     (doesFileExist, removeFile)
 import           System.FilePath      ((</>))
-import           System.IO            (IOMode (..), hClose, openFile)
+import           System.IO            (IOMode (..), hClose)
 
+import           Hakyll.Core.Util.File (attemptOpenFile)
 
 --------------------------------------------------------------------------------
 -- | Simple wrapper type
@@ -157,7 +158,7 @@ get store identifier = do
 
     -- 'decodeFile' from Data.Binary which closes the file ASAP
     decodeClose = do
-        h   <- openFile path ReadMode
+        h   <- attemptOpenFile path ReadMode
         lbs <- BL.hGetContents h
         BL.length lbs `seq` hClose h
         return $ decode lbs
@@ -198,3 +199,4 @@ hash = toHex . B.unpack . MD5.hash . T.encodeUtf8 . T.pack . intercalate "/"
     toHex [] = ""
     toHex (x : xs) | x < 16 = '0' : showHex x (toHex xs)
                    | otherwise = showHex x (toHex xs)
+

@@ -149,7 +149,7 @@ checkDestination = do
 checkFile :: FilePath -> Checker ()
 checkFile filePath = do
     logger   <- checkerLogger <$> ask
-    contents <- liftIO $ readFile filePath
+    contents <- liftIO $ attemptReadFile filePath
     Logger.header logger $ "Checking file " ++ filePath
 
     let urls = getUrls $ TS.parseTags contents
