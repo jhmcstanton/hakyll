@@ -6,13 +6,14 @@ module Hakyll.Core.Runtime
 
 --------------------------------------------------------------------------------
 import           Control.Concurrent            (threadDelay)
-import           Control.Concurrent.Async      (Async, mapConcurrently, wait)
+import           Control.Concurrent.Async      (mapConcurrently)
 import           Control.Concurrent.STM
+import           Control.Exception.Base        (Exception)
 import           Control.Monad                 (unless)
 import           Control.Monad.Except          (ExceptT, runExceptT, throwError)
 import           Control.Monad.Reader          (ask)
 import           Control.Monad.RWS             (RWST, runRWST)
-import qualified Control.Monad.State as State  (get, modify)
+import qualified Control.Monad.State as State
 import           Control.Monad.Trans           (liftIO)
 import           Data.List                     (intercalate)
 import           Data.Map                      (Map)
@@ -285,7 +286,9 @@ handleResult id' result = do
                     depId `S.member` done ||
                      (depId, depSnapshot) `S.member` snapshots
             deps <- runtimeDeps <$> readTVar var
-            let otherDeps = deps M.! depId
+            otherDeps <- case M.lookup depId deps of
+                           Nothing -> missingDepError depId
+                           Just deps' -> pure deps'
 
             let depState = case (depDone, id' `S.member` otherDeps) of
                              (_, True)  -> DepCycle
@@ -337,3 +340,16 @@ dependencyCycleError :: Identifier -> Identifier -> Runtime ()
 dependencyCycleError l r = throwError msg where
   msg = "Dependency cycle detected: " ++ show l ++
         " depends on " ++ show r
+
+--------------------------------------------------------------------------------
+missingDepError :: Identifier -> STM a
+missingDepError id' = throwSTM (RuntimePreconditionException msg) where
+  msg = "Hakyll.Core.Runtime precondition exception: dependency " ++
+        "set missing for " ++ show id' ++ ". You may need to clean and " ++
+        "rebuild your site."
+
+--------------------------------------------------------------------------------
+data RuntimePreconditionException =
+  RuntimePreconditionException String deriving Show
+
+instance Exception RuntimePreconditionException
