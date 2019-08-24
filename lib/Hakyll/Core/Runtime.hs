@@ -5,7 +5,8 @@ module Hakyll.Core.Runtime
 
 
 --------------------------------------------------------------------------------
-import           Control.Concurrent.Async      (Async, async, wait)
+import           Control.Concurrent            (threadDelay)
+import           Control.Concurrent.Async      (Async, mapConcurrently, wait)
 import           Control.Concurrent.STM
 import           Control.Monad                 (unless)
 import           Control.Monad.Except          (ExceptT, runExceptT, throwError)
@@ -73,7 +74,7 @@ run config logger rules = do
             { runtimeDone      = S.empty
             , runtimeSnapshots = S.empty
             , runtimeTodo      = M.empty
-            , runtimeWorkers   = M.empty
+            , runtimeDeps      = M.empty
             , runtimeFacts     = oldFacts
             }
 
@@ -114,7 +115,7 @@ data RuntimeState' = RuntimeState'
     { runtimeDone      :: Set Identifier
     , runtimeSnapshots :: Set (Identifier, Snapshot)
     , runtimeTodo      :: Map Identifier (Compiler SomeItem)
-    , runtimeWorkers   :: Map Identifier (Async (Runtime()))
+    , runtimeDeps      :: Map Identifier (S.Set Identifier)
     , runtimeFacts     :: DependencyFacts
     }
 
@@ -154,11 +155,15 @@ scheduleOutOfDate = do
     -- Print messages
     mapM_ (Logger.debug logger) msgs
 
+    let todos = todo `M.union` todo'
+    let deps  = M.fromList . fmap (\k -> (k, mempty)) $ M.keys todos
+
     -- Update facts and todo items
     modify $ \s -> s
         { runtimeDone  = runtimeDone s `S.union`
             (S.fromList identifiers `S.difference` ood)
-        , runtimeTodo  = todo `M.union` todo'
+        , runtimeTodo  = todos
+        , runtimeDeps  = deps
         , runtimeFacts = facts'
         }
 
@@ -166,63 +171,42 @@ scheduleOutOfDate = do
 --------------------------------------------------------------------------------
 pickAndChase :: Runtime ()
 pickAndChase = do
-    todo         <- runtimeTodo    <$> get
-    workers      <- runtimeWorkers <$> get
-    let todo'     = M.filterWithKey (\k _ -> not $ k `M.member` workers) todo
-    case M.minViewWithKey todo' of
-        Nothing            -> do
-            completedIds <- runtimeDone <$> get
-            liftIO . putStrLn $ "1 Completed ids: " ++ (show completedIds)
-            liftIO . putStrLn $ "1 Worker ids: " ++ (show $ M.keys workers)
-            rs <- liftIO $ traverse wait workers
-            _  <- sequence rs -- wait on the workers
-            completedIds <- runtimeDone <$> get
-            workers      <- runtimeWorkers <$> get
-            liftIO . putStrLn $ "2 Completed ids: " ++ (show completedIds)
-            liftIO . putStrLn $ "2 Worker ids: " ++ (show $ M.keys workers)
-            pure ()
-        Just ((id', _), _) -> do
-            chase [] id'
-            pickAndChase
+    r     <- ask
+    s     <- State.get
+    todo  <- liftIO $ runtimeTodo <$> readTVarIO s
+    let runChase id' = runExceptT (runRWST (chase id') r s)
+    _ <- liftIO . mapConcurrently runChase $ (M.keys todo)
+    pure ()
 
 --------------------------------------------------------------------------------
-chase :: [Identifier] -> Identifier -> Runtime ()
-chase trail id'
-    | id' `elem` trail = throwError $ "Hakyll.Core.Runtime.chase: " ++
-        "Dependency cycle detected: " ++ intercalate " depends on "
-            (map show $ dropWhile (/= id') (reverse trail) ++ [id'])
-    | otherwise        = do
-        liftIO . putStrLn $ "chasing " ++ (show id')
-        logger   <- runtimeLogger        <$> ask
-        todo     <- runtimeTodo          <$> get
-        provider <- runtimeProvider      <$> ask
-        universe <- runtimeUniverse      <$> ask
-        routes   <- runtimeRoutes        <$> ask
-        store    <- runtimeStore         <$> ask
-        config   <- runtimeConfiguration <$> ask
-        Logger.debug logger $ "Processing " ++ show id'
+chase :: Identifier -> Runtime ()
+chase id' = do
+  logger   <- runtimeLogger        <$> ask
+  todo     <- runtimeTodo          <$> get
+  provider <- runtimeProvider      <$> ask
+  universe <- runtimeUniverse      <$> ask
+  routes   <- runtimeRoutes        <$> ask
+  store    <- runtimeStore         <$> ask
+  config   <- runtimeConfiguration <$> ask
+  Logger.debug logger $ "Processing " ++ show id'
 
-        let compiler = todo M.! id'
-            read' = CompilerRead
-                { compilerConfig     = config
-                , compilerUnderlying = id'
-                , compilerProvider   = provider
-                , compilerUniverse   = M.keysSet universe
-                , compilerRoutes     = routes
-                , compilerStore      = store
-                , compilerLogger     = logger
-                }
+  let compiler = todo M.! id'
+      read' = CompilerRead
+          { compilerConfig     = config
+          , compilerUnderlying = id'
+          , compilerProvider   = provider
+          , compilerUniverse   = M.keysSet universe
+          , compilerRoutes     = routes
+          , compilerStore      = store
+          , compilerLogger     = logger
+          }
 
-        result <- liftIO . async $ runCompiler compiler read'
-        let chased = fmap (handleResult trail id') result
-        modify $ \s ->
-          s { runtimeWorkers = M.insert id' chased (runtimeWorkers s) }
-        pure ()
+  result <- liftIO $ runCompiler compiler read'
+  handleResult id' result
 
 --------------------------------------------------------------------------------
-handleResult :: [Identifier] -> Identifier -> (CompilerResult SomeItem) -> Runtime ()
-handleResult trail id' result = do
-  liftIO . putStrLn $ "Top of Handle Result"
+handleResult :: Identifier -> (CompilerResult SomeItem) -> Runtime ()
+handleResult id' result = do
   logger   <- runtimeLogger        <$> ask
   provider <- runtimeProvider      <$> ask
   routes   <- runtimeRoutes        <$> ask
@@ -238,11 +222,13 @@ handleResult trail id' result = do
       CompilerSnapshot snapshot c -> do
           -- Update info. The next 'chase' will pick us again at some
           -- point so we can continue then.
+          Logger.debug logger $ "Compiled snapshot of: " ++ show id'
           modify $ \s -> s
               { runtimeSnapshots =
                   S.insert (id', snapshot) (runtimeSnapshots s)
               , runtimeTodo      = M.insert id' c (runtimeTodo s)
               }
+          chase id'
 
       -- Huge success
       CompilerDone (SomeItem item) cwrite -> do
@@ -273,7 +259,7 @@ handleResult trail id' result = do
           -- Save! (For load)
           liftIO $ save store item
 
-          liftIO . putStrLn $ "In compiler done"
+          Logger.debug logger $ "Fully compiled: " ++ show id'
           -- Update state
           modify $ \s -> s
               { runtimeDone  = S.insert id' (runtimeDone s)
@@ -283,9 +269,11 @@ handleResult trail id' result = do
 
       -- Try something else first
       CompilerRequire dep c -> do
-          liftIO . putStrLn $ "In compilerRequire"
           -- Update the compiler so we don't execute it twice
           let (depId, depSnapshot) = dep
+          Logger.debug logger $
+            "Compiler requirement found for: " ++ show id' ++
+            ", requirement: " ++ show depId
           var <- State.get
           (action, depDone) <- liftIO . atomically $ do
             done      <- runtimeDone      <$> readTVar var
@@ -295,31 +283,37 @@ handleResult trail id' result = do
             -- if we previously saved the snapshot (runtimeSnapshots).
             let depDone =
                     depId `S.member` done ||
-                    (depId, depSnapshot) `S.member` snapshots
+                     (depId, depSnapshot) `S.member` snapshots
+            deps <- runtimeDeps <$> readTVar var
+            let otherDeps = deps M.! depId
+
+            let depState = case (depDone, id' `S.member` otherDeps) of
+                             (_, True)  -> DepCycle
+                             (True, _)  -> DepDone
+                             (False, _) -> DepRequired
 
             modifyTVar' var $ \s -> s {
                   runtimeTodo = M.insert id'
                     (if depDone then c else compilerResult result)
                     (runtimeTodo s)
+                , runtimeDeps =
+                    M.adjust (S.insert depId ) id' (runtimeDeps s)
                 }
 
-            let runtimeAction = if depDone
-                                then chase trail id'
-                                else chase (id' : trail) depId
+            let runtimeAction = case depState of
+                   DepCycle -> dependencyCycleError id' depId
+                   DepDone  -> chase id'
+                   DepRequired -> do
+                     liftIO $ threadDelay 500000
+                     chase id'
             pure (runtimeAction, depDone)
 
-          action
           -- If the required item is already compiled, continue, or, start
           -- chasing that
           Logger.debug logger $ "Require " ++ show depId ++
               " (snapshot " ++ depSnapshot ++ "): " ++
               (if depDone then "OK" else "chasing")
-          eThread <- liftIO . atomically $ do
-            workers <- runtimeWorkers <$> readTVar var
-            pure $ M.lookup (if depDone then id' else depId) workers
-          case eThread of
-            Nothing -> throwError concurrencyException
-            Just t  -> liftIO (wait t) >> pure ()
+          action
 
 --------------------------------------------------------------------------------
 -- WARNING: It is very easy to accidentally use an out-of-date
@@ -336,8 +330,10 @@ get :: Runtime RuntimeState'
 get = State.get >>= \var -> liftIO (readTVarIO var)
 
 --------------------------------------------------------------------------------
-concurrencyException :: String
-concurrencyException =
-  "Concurrency Exception. This should never happen. Please report this " ++
-  "to the Hakyll issue tracker. In the mean time, try running Hakyll " ++
-  "in single threaded mode using '+RTS -N1'."
+data DependencyState = DepDone | DepRequired | DepCycle
+
+--------------------------------------------------------------------------------
+dependencyCycleError :: Identifier -> Identifier -> Runtime ()
+dependencyCycleError l r = throwError msg where
+  msg = "Dependency cycle detected: " ++ show l ++
+        " depends on " ++ show r
