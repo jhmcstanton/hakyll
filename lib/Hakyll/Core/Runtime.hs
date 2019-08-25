@@ -5,7 +5,7 @@ module Hakyll.Core.Runtime
 
 
 --------------------------------------------------------------------------------
-import           Control.Concurrent            (threadDelay)
+import           Control.Concurrent            (yield)
 import           Control.Concurrent.Async      (mapConcurrently)
 import           Control.Concurrent.STM
 import           Control.Exception.Base        (Exception)
@@ -300,14 +300,14 @@ handleResult id' result = do
                     (if depDone then c else compilerResult result)
                     (runtimeTodo s)
                 , runtimeDeps =
-                    M.adjust (S.insert depId ) id' (runtimeDeps s)
+                    M.adjust (S.insert depId) id' (runtimeDeps s)
                 }
 
             let runtimeAction = case depState of
                    DepCycle -> dependencyCycleError id' depId
                    DepDone  -> chase id'
                    DepRequired -> do
-                     liftIO $ threadDelay 500000
+                     liftIO $ yield
                      chase id'
             pure (runtimeAction, depDone)
 
